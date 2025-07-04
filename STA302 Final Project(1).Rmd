@@ -1,0 +1,203 @@
+---
+title: "STA302 Final Project - Model Selection and Diagnostics"
+author: "LONG PINGSHAN, NICHOLAS KOH"
+date: "2025-05-20"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(broom)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(car)
+```
+
+## 1  Data preparation
+
+```{r data_prep}
+airbnb_full <- read_csv("AB_NYC_2019.csv")
+
+set.seed(302)
+airbnb <- airbnb_full %>%
+  slice_sample(n = 2000) %>%                 # random 2000 rows
+  filter(price > 0, price <= 1000,           # trim extremes
+         minimum_nights <= 30) %>%           # long-stay cap
+  drop_na(calculated_host_listings_count,    # remove NAs
+          reviews_per_month) %>%
+  mutate(
+    neighbourhood_group = factor(neighbourhood_group),
+    room_type           = factor(room_type),
+    log_price           = log(price)
+  )
+```
+
+## 2  Transformation candidates
+
+```{r transform}
+airbnb_t <- airbnb %>%
+  mutate(
+    ln_reviews        = log1p(number_of_reviews),
+    ln_reviews_month  = log1p(reviews_per_month),
+    sqrt_min_nights   = sqrt(minimum_nights),
+    sqrt_avail_365    = sqrt(availability_365)
+  )
+```
+
+## 3  Baseline vs transformed models
+
+```{r model_compare}
+model_raw <- lm(
+  log(price) ~ calculated_host_listings_count +
+    neighbourhood_group + room_type +
+    minimum_nights + availability_365 +
+    number_of_reviews + reviews_per_month,
+  data = airbnb
+)
+
+model_xfrm <- lm(
+  log(price) ~ calculated_host_listings_count +
+    neighbourhood_group + room_type +
+    sqrt_min_nights + sqrt_avail_365 +
+    ln_reviews + ln_reviews_month,
+  data = airbnb_t
+)
+
+model_comp <- tibble(
+  Model  = c("Raw", "Transformed"),
+  AIC    = AIC(model_raw, model_xfrm)$AIC,
+  BIC    = BIC(model_raw, model_xfrm)$BIC,
+  Adj_R2 = c(summary(model_raw)$adj.r.squared,
+             summary(model_xfrm)$adj.r.squared)
+)
+
+kable(model_comp, caption = "Table 1. Model comparison metrics")
+```
+
+```{r pick_model}
+model_work <- model_xfrm  # chosen model
+data_work  <- airbnb_t
+```
+
+## 4  Coefficient table
+
+```{r coef_table}
+summary_tbl <- tidy(model_work, conf.int = TRUE, exponentiate = TRUE) %>%
+  transmute(
+    Term           = term,
+    Exp_Estimate   = round(estimate, 3),
+    Std_Error      = round(std.error, 3),
+    CI_2_5         = round(conf.low, 3),
+    CI_97_5        = round(conf.high, 3),
+    p_value        = signif(p.value, 3)
+  )
+
+kable(summary_tbl,
+      caption = "Table 2. Exponentiated coefficients (multiplicative effect on nightly price)")
+
+write_csv(summary_tbl, "model_coef_table.csv")
+```
+
+## 5  Diagnostics
+
+```{r diagnostics, fig.height = 6, fig.width = 8}
+diag_df <- augment(model_work) %>%
+  mutate(obs_log = .fitted + .resid)
+
+p1 <- ggplot(diag_df, aes(.fitted, obs_log)) +
+  geom_point(alpha = 0.4) +
+  labs(title = "Response vs Fitted",
+       x = "Fitted log-price", y = "Observed log-price") +
+  theme_minimal()
+
+p2 <- ggplot(diag_df, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, lty = 2) +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted log-price", y = "Raw residuals") +
+  theme_minimal()
+
+p3 <- ggplot(diag_df, aes(.fitted, .std.resid)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, lty = 2) +
+  labs(title = "Std. Residuals vs Fitted",
+       x = "Fitted log-price", y = "Standardised residuals") +
+  theme_minimal()
+
+p4 <- ggplot(diag_df, aes(sample = .std.resid)) +
+  stat_qq(alpha = 0.4) +
+  stat_qq_line() +
+  labs(title = "QQ-plot",
+       x = "Theoretical quantiles", y = "Standardised residuals") +
+  theme_minimal()
+
+(p1 | p2) / (p3 | p4)
+
+ggsave("diagnostic_grid.png", width = 8, height = 6, dpi = 300)
+```
+
+## 6  Influence diagnostics
+
+```{r influence}
+infl_df <- augment(model_work, data = data_work %>% mutate(id = row_number())) %>%
+  mutate(cook_thresh = 4 / n()) %>%
+  select(id, price, .std.resid, .hat, .cooksd, cook_thresh)
+
+outlier_df <- infl_df %>%
+  filter(abs(.std.resid) > 3 |
+         .cooksd        > cook_thresh |
+         .hat           > 2 * mean(.hat))
+
+kable(outlier_df %>% arrange(desc(.cooksd)),
+      caption = "Table 3. Candidate high-influence cases")
+```
+
+## 7  Sensitivity analysis
+
+```{r sensitivity}
+model_drop <- lm(
+  formula(model_work),
+  data = anti_join(data_work %>% mutate(id = row_number()), outlier_df, by = "id")
+)
+
+sens_tbl <- bind_rows(
+  tidy(model_work) %>% mutate(model = "Full"),
+  tidy(model_drop) %>% mutate(model = "Dropped")
+) %>%
+  select(term, estimate, model) %>%
+  pivot_wider(names_from = model, values_from = estimate) %>%
+  mutate(Relative_Diff = abs(Dropped - Full) / abs(Full))
+
+kable(sens_tbl,
+      caption = "Table 4. Coefficient sensitivity after dropping candidates")
+```
+
+## 8  Multicollinearity check
+
+```{r vif}
+vif_vals <- vif(model_work)
+
+vif_tbl <- tibble(
+  Term = names(vif_vals),
+  VIF  = as.numeric(vif_vals)
+)
+
+kable(vif_tbl, caption = "Table 5. Variance Inflation Factors")
+```
+
+## 9  Optional predictor pruning
+
+```{r prune}
+ln_rm_vif <- vif_vals["ln_reviews_month"]
+
+model_final <- if (!is.na(ln_rm_vif) && is.finite(ln_rm_vif) && ln_rm_vif > 5) {
+  update(model_work, . ~ . - ln_reviews_month)
+} else {
+  model_work
+}
+
+save(model_final, file = "airbnb_final_model.RData")
+```
